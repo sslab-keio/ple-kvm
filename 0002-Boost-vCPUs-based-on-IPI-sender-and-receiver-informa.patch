@@ -1,0 +1,142 @@
+From 939c61e63dfe76e6dd609fa029c85ed055507344 Mon Sep 17 00:00:00 2001
+From: Kenta Ishiguro <kentaishiguro@sslab.ics.keio.ac.jp>
+Date: Wed, 14 Jul 2021 01:53:31 +0900
+Subject: [PATCH 2/2] Boost vCPUs based on IPI-sender and receiver information
+
+This commit monitors IPI communication between vCPUs and leverages the
+relationship between vCPUs to select boost candidates.
+---
+ arch/x86/kvm/lapic.c     | 17 +++++++++++++++++
+ arch/x86/kvm/x86.c       |  1 +
+ include/linux/kvm_host.h |  2 ++
+ virt/kvm/kvm_main.c      | 22 +++++++++++++++++-----
+ 4 files changed, 37 insertions(+), 5 deletions(-)
+
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index 7356a56e6282..c74b37654fd3 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -1226,6 +1226,21 @@ void kvm_apic_set_eoi_accelerated(struct kvm_vcpu *vcpu, int vector)
+ }
+ EXPORT_SYMBOL_GPL(kvm_apic_set_eoi_accelerated);
+ 
++static void mark_ipi_receiver(struct kvm_lapic *apic, struct kvm_lapic_irq *irq)
++{
++	struct kvm_vcpu *dest_vcpu;
++	u64 prev_ipi_received;
++
++	dest_vcpu = kvm_get_vcpu_by_id(apic->vcpu->kvm, irq.dest_id);
++	if (!dest_vcpu)
++		return;
++
++	if (READ_ONCE(dest_vcpu->scheduled_out)) {
++		prev_ipi_received = READ_ONCE(dest_vcpu->ipi_received);
++		WRITE_ONCE(dest_vcpu->ipi_received, prev_ipi_received | (1ull << apic->vcpu->vcpu_id));
++	}
++}
++
+ static void apic_send_ipi(struct kvm_lapic *apic, u32 icr_low, u32 icr_high)
+ {
+ 	struct kvm_lapic_irq irq;
+@@ -1244,6 +1259,8 @@ static void apic_send_ipi(struct kvm_lapic *apic, u32 icr_low, u32 icr_high)
+ 
+ 	trace_kvm_apic_ipi(icr_low, irq.dest_id);
+ 
++	mark_ipi_receiver(apic, &irq);
++
+ 	kvm_irq_delivery_to_apic(apic->vcpu->kvm, apic, &irq, NULL);
+ }
+ 
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index cf95c36cb4f4..0d7e62efe2ca 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -8357,6 +8357,7 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 
+ 	trace_kvm_entry(vcpu->vcpu_id);
+ 	guest_enter_irqoff();
++	WRITE_ONCE(vcpu->ipi_received, 0);
+ 
+ 	fpregs_assert_state_consistent();
+ 	if (test_thread_flag(TIF_NEED_FPU_LOAD))
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index bcb9b2ac0791..ed9c0a3f168a 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -317,6 +317,8 @@ struct kvm_vcpu {
+ #endif
+ 	bool preempted;
+ 	bool ready;
++	bool scheduled_out;
++	u64 ipi_received;
+ 	struct kvm_vcpu_arch arch;
+ 	struct dentry *debugfs_dentry;
+ };
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 70f03ce0e5c1..a9bfdf69cc7e 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -353,6 +353,8 @@ static void kvm_vcpu_init(struct kvm_vcpu *vcpu, struct kvm *kvm, unsigned id)
+ 	kvm_vcpu_set_dy_eligible(vcpu, false);
+ 	vcpu->preempted = false;
+ 	vcpu->ready = false;
++	vcpu->scheduled_out = false;
++	vcpu->ipi_received = 0;
+ 	preempt_notifier_init(&vcpu->preempt_notifier, &kvm_preempt_ops);
+ }
+ 
+@@ -2655,6 +2657,7 @@ void kvm_vcpu_on_spin(struct kvm_vcpu *me, bool yield_to_kernel_mode)
+ 	struct kvm_vcpu *vcpu;
+ 	int last_boosted_vcpu = me->kvm->last_boosted_vcpu;
+ 	int yielded = 0;
++	u64 ipi_received;
+ 	int try = 3;
+ 	int pass;
+ 	int i;
+@@ -2674,15 +2677,21 @@ void kvm_vcpu_on_spin(struct kvm_vcpu *me, bool yield_to_kernel_mode)
+ 				continue;
+ 			} else if (pass && i > last_boosted_vcpu)
+ 				break;
+-			if (!READ_ONCE(vcpu->ready))
+-				continue;
++			if (!READ_ONCE(vcpu->preempted)) {
++				ipi_received = READ_ONCE(vcpu->ipi_received);
++				if (!(READ_ONCE(vcpu->ready) && !!(ipi_received & (1ull << me->vcpu_id)))) {
++					WRITE_ONCE(vcpu->ipi_received, ipi_received | (1ull << me->vcpu_id));
++					continue;
++				}
++			}
+ 			if (vcpu == me)
+ 				continue;
+ 			if (swait_active(&vcpu->wq) && !vcpu_dy_runnable(vcpu))
+ 				continue;
+-			if (READ_ONCE(vcpu->preempted) && yield_to_kernel_mode &&
+-				!kvm_arch_vcpu_in_kernel(vcpu))
+-				continue;
++			if (yield_to_kernel_mode && !kvm_arch_vcpu_in_kernel(vcpu)) {
++				if (!(READ_ONCE(vcpu->ipi_received) & (1 << me->vcpu_id)))
++					continue;
++			}
+ 			if (!kvm_vcpu_eligible_for_directed_yield(vcpu))
+ 				continue;
+ 
+@@ -4388,6 +4397,8 @@ static void kvm_sched_in(struct preempt_notifier *pn, int cpu)
+ 
+ 	WRITE_ONCE(vcpu->preempted, false);
+ 	WRITE_ONCE(vcpu->ready, false);
++	WRITE_ONCE(vcpu->scheduled_out, false);
++	WRITE_ONCE(vcpu->ipi_received, 0);
+ 
+ 	__this_cpu_write(kvm_running_vcpu, vcpu);
+ 	kvm_arch_sched_in(vcpu, cpu);
+@@ -4403,6 +4414,7 @@ static void kvm_sched_out(struct preempt_notifier *pn,
+ 		WRITE_ONCE(vcpu->preempted, true);
+ 		WRITE_ONCE(vcpu->ready, true);
+ 	}
++	WRITE_ONCE(vcpu->scheduled_out, true);
+ 	kvm_arch_vcpu_put(vcpu);
+ 	__this_cpu_write(kvm_running_vcpu, NULL);
+ }
+-- 
+2.20.1
+
