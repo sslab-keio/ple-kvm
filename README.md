@@ -1,5 +1,7 @@
 # Mitigating Excessive Pause-Loop Exiting in VM-Agnostic KVM
 
+**These patches are for Linux Kernel 5.6**
+
 In our research work presented last week at the VEE 2021 conference [1], we
 found out that a lot of continuous Pause-Loop-Exiting (PLE) events occur
 due to three problems we have identified: 1) Linux CFS ignores hints from
